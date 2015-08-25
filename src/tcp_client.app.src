@@ -1,0 +1,14 @@
+{application, tcp_client,
+ [
+  {description, "TCP Client Connections Manager"},
+  {vsn, "0.0.1"},
+  {applications,
+   [
+    kernel,
+    stdlib
+   ]
+  },
+  {modules, []},
+  {registered, []}
+ ]
+}.
