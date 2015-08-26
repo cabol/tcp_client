@@ -9,6 +9,7 @@
    ]
   },
   {modules, []},
+  {mod, {tcp_client_app, []}},
   {registered, []}
  ]
 }.

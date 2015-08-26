@@ -1,13 +1,19 @@
 %%%-------------------------------------------------------------------
+%%% @author Carlos Andres Bolaños R.A. <cabol.dev@gmail.com>
 %%% @doc
-%%% This module was based on Basho's Riak Erlang Client, specifically
-%%% from module `riakc_pb_socket'.
+%%% This module was takemn on Basho's Riak Erlang Client, specifically
+%%% from module `riakc_pb_socket', and modified to work as just a
+%%% generic socket client.
 %%% @end
 %%% @see <a href="https://github.com/basho/riak-erlang-client">Riak Erlang Client</a>
 %%%-------------------------------------------------------------------
 -module(tcp_client_socket).
 
+-behaviour(poolboy_worker).
 -behaviour(gen_server).
+
+%% API - Poolboy Callback
+-export([start_link/1]).
 
 %% API
 -export([start_link/2, start_link/3,
@@ -28,7 +34,7 @@
 %%%===================================================================
 
 %% Constants
--define(DEFAULT_TIMEOUT, 10000).
+-define(DEFAULT_TIMEOUT, 30000).
 -define(FIRST_RECONNECT_INTERVAL, 100).
 -define(MAX_RECONNECT_INTERVAL, 30000).
 
@@ -43,7 +49,13 @@
                           auto_reconnect |
                           {auto_reconnect, boolean()} |
                           keepalive |
-                          {keepalive, boolean()}.
+                          {keepalive, boolean()} |
+                          {traspost, gen_tcp | ssl} |
+                          {credentials, string(), string()} |
+                          {cacertfile, string()} |
+                          {certfile, string()} |
+                          {keyfile, string()} |
+                          {ssl_opts, [ssl:ssl_option()]}.
 
 %% A list of client options.
 -type client_options() :: [client_option()].
@@ -56,6 +68,7 @@
 
 %% Response
 -type sync_reply() :: {ok, Msg :: binary()} | {error, term()}.
+-type reply()      :: {ok, req_id()}.
 
 %% Request
 -record(request, {ref     :: reference(),
@@ -73,6 +86,14 @@
 
 %% Inputs for a MapReduce job.
 -type connection_failure() :: {Reason::term(), FailureCount::integer()}.
+
+%% Exported types
+-export_type([address/0,
+              portnum/0,
+              client_options/0,
+              message/0,
+              sync_reply/0,
+              reply/0]).
 
 %% State
 -record(state, {% address to connect to
@@ -117,10 +138,18 @@
 %%% API
 %%%===================================================================
 
-%% @private Like `gen_server:call/3', but with the timeout hardcoded
-%% to `infinity'.
-call_infinity(Pid, Msg) ->
-  gen_server:call(Pid, Msg, infinity).
+%% @doc Poolboy callback.
+-spec start_link(proplists:proplist()) -> gen:start_ret().
+start_link(Args) ->
+  Address = keyfind(address, Args),
+  Port = keyfind(port, Args),
+  Options = keyfind(options, Args, []),
+  case Address /= undefined andalso Port /= undefined of
+    true ->
+      start_link(Address, Port, Options);
+    _ ->
+      throw(missing_address_port)
+  end.
 
 %% @doc Create a linked process to talk with the server on Address:Port
 %%      Client id will be assigned by the server.
@@ -144,7 +173,7 @@ is_connected(Pid) ->
 %% @equiv send(Pid, Msg, ?DEFAULT_TIMEOUT)
 -spec sync_send(pid(), message()) -> sync_reply().
 sync_send(Pid, Msg) ->
-  send(Pid, Msg, ?DEFAULT_TIMEOUT).
+  sync_send(Pid, Msg, default_timeout()).
 
 %% @doc Sends a message on the current connection and waits until server
 %%      respose arrives. Works as Request/Response.
@@ -153,18 +182,23 @@ sync_send(Pid, Msg, Timeout) ->
   call_infinity(Pid, {req, Msg, Timeout}).
 
 %% @equiv send(Pid, Msg, ?DEFAULT_TIMEOUT)
--spec send(pid(), message()) -> {ok, req_id()}.
+-spec send(pid(), message()) -> reply().
 send(Pid, Msg) ->
-  send(Pid, Msg, ?DEFAULT_TIMEOUT).
+  send(Pid, Msg, default_timeout()).
 
 %% @doc Sends a message on the current connection but returns immediately
 %%      with a request id. Works asynchronously, and if the server sends
 %%      a response back, it is sent directly to the caller process.
--spec send(pid(), message(), timeout()) -> {ok, req_id()}.
+-spec send(pid(), message(), timeout()) -> reply().
 send(Pid, Msg, Timeout) ->
   ReqId = mk_reqid(),
   gen_server:cast(Pid, {req, Msg, Timeout, {ReqId, self()}}),
   {ok, ReqId}.
+
+%% @private Like `gen_server:call/3', but with the timeout hardcoded
+%% to `infinity'.
+call_infinity(Pid, Msg) ->
+  gen_server:call(Pid, Msg, infinity).
 
 %%%===================================================================
 %%% gen_server callbacks
@@ -172,7 +206,7 @@ send(Pid, Msg, Timeout) ->
 
 %% @hidden
 init([Address, Port, Options]) ->
-  %% Schedule a reconnect as the first action.  If the server is up then
+  %% Schedule a reconnect as the first action. If the server is up then
   %% the handle_info(reconnect) will run before any requests can be sent.
   State = parse_options(Options, #state{address = Address,
                                         port = Port,
@@ -345,7 +379,9 @@ parse_options([{cacertfile, File} | Options], State) ->
 parse_options([{keyfile, File} | Options], State) ->
   parse_options(Options, State#state{keyfile = File});
 parse_options([{ssl_opts, Opts} | Options], State) ->
-  parse_options(Options, State#state{ssl_opts = Opts}).
+  parse_options(Options, State#state{ssl_opts = Opts});
+parse_options([{transport, Transport} | Options], State) ->
+  parse_options(Options, State#state{transport = Transport}).
 
 %% @private
 %% Reply to caller - form clause first in case a ReqId/Client was passed
@@ -418,7 +454,7 @@ start_tls(State=#state{sock=Sock}) ->
   case ssl:connect(Sock, Options, 1000) of
     {ok, SSLSock} ->
       ok = ssl:setopts(SSLSock, [{active, once}]),
-      {ok, State};
+      {ok, State#state{sock = SSLSock, transport = ssl}};
     {error, Reason2} ->
       {error, Reason2}
   end.
@@ -537,12 +573,27 @@ remove_queued_request(Ref, State) ->
       NewState#state{queue = queue:from_list(L2)}
   end.
 
-%% Called on timeout for an operation
 %% @private
+%% Called on timeout for an operation
 on_timeout(_Request, State) ->
   {reply, {error, timeout}, State}.
+
+%% @private
+default_timeout() ->
+  application:get_env(tcp_client, timeout, ?DEFAULT_TIMEOUT).
 
 %% @private
 %% Only has to be unique per-pid
 mk_reqid() ->
   erlang:phash2(erlang:now()).
+
+%% @private
+keyfind(Key, TupleList) ->
+  keyfind(Key, TupleList, undefined).
+
+%% @private
+keyfind(Key, TupleList, Default) ->
+  case lists:keyfind(Key, 1, TupleList) of
+    {_K, V} -> V;
+    _       -> Default
+  end.
